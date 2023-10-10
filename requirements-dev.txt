@@ -1,0 +1,10 @@
+# isort
+# black
+# tox
+# pytest
+# pytest-cov
+# Flake8-pyproject
+# flake8
+# mypy
+# jsf
+twine

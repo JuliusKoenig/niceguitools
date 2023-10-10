@@ -1,0 +1,12 @@
+MANIFEST.in
+README.md
+pyproject.toml
+setup.py
+src/niceguitools/__init__.py
+src/niceguitools/__version__
+src/niceguitools/test_app.py
+src/niceguitools.egg-info/PKG-INFO
+src/niceguitools.egg-info/SOURCES.txt
+src/niceguitools.egg-info/dependency_links.txt
+src/niceguitools.egg-info/not-zip-safe
+src/niceguitools.egg-info/top_level.txt

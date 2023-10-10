@@ -1,0 +1,68 @@
+[project]
+name = "niceguitools"
+dynamic = ["version"]
+authors = [
+    { name = "Julius König", email = "info@bastelquartier.de" }
+]
+description = "A collection of tools for nicegui"
+readme = "README.md"
+keywords = ["nicegui", "gui", "tools", "niceguitools"]
+license = { text = "GPL-3.0" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = {attr = "niceguitools.__version__"}
+
+[tool.setuptools]
+zip-safe = false
+license-files = ["LICENSE"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["niceguitools*"]
+
+[tool.pytest.ini_options]
+addopts = "--cov=niceguitools --cov-append --cov-report=term-missing"
+testpaths = [
+    "tests",
+]
+
+[tool.mypy]
+mypy_path = "src"
+plugins = "pydantic.mypy"
+check_untyped_defs = true
+no_implicit_optional = true
+show_error_codes = true
+strict_equality = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+warn_unused_configs = true
+no_implicit_reexport = true
+
+[tool.isort]
+profile = "black"
+skip_gitignore = true
+
+[tool.black]
+line-length = 160
+
+[tool.flake8]
+max-line-length = 160

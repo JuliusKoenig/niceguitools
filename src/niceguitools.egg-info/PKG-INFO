@@ -1,0 +1,21 @@
+Metadata-Version: 2.1
+Name: niceguitools
+Version: 0.0.1
+Summary: A collection of tools for nicegui
+Author-email: Julius König <info@bastelquartier.de>
+License: GPL-3.0
+Keywords: nicegui,gui,tools,niceguitools
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: GNU General Public License v3 (GPLv3)
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Description-Content-Type: text/markdown
+
+# niceguitools
