@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import json
 import logging
+import time
 from copy import deepcopy
 from typing import Any, Optional, Union, Callable, Awaitable, Coroutine, Type, Literal
 
@@ -22,7 +23,7 @@ OperatorCallable = Callable[[OperatorAttr1, OperatorAttr2], Awaitable[OperatorRe
 OperatorSyncCallable = Callable[[OperatorAttr1, OperatorAttr2], OperatorResult]
 NewOperatorCallable = Union[OperatorSyncCallable, OperatorCallable]
 
-ExternalReloadAttr = Union[list[BaseModel], list[dict[str, Any]], str]
+ExternalReloadAttr = Union[list[Any], list[dict[str, Any]], str]
 ExternalReloadResult = None
 ExternalReloadAwaitable = Awaitable[ExternalReloadResult]
 ExternalReloadAsyncCallable = Callable[[ExternalReloadAttr], Awaitable[ExternalReloadResult]]
@@ -40,13 +41,14 @@ _AFTER_CALLABLE: Optional[dict[id, ExternalReloadCallable]] = None
 class PydanticFilter:
     def __init__(self,
                  get_models: Callable[[], list[BaseModel]],
+                 model: Type[BaseModel],
                  name: Optional[str] = None,
                  current_filter: Optional[list[tuple[str, str, str, bool]]] = None,
                  operator: Optional[dict[str, NewOperatorCallable]] = None,
                  dense: bool = False,
                  reload_btn: bool = True,
                  auto_reload: bool = True,
-                 on_reload_external: Optional[ExternalReloadCallable] = None,
+                 mode: Literal["pydantic", "dict", "str"] = "pydantic",
                  stack_level: int = 2):
         """
         A filter for a list of models
@@ -59,7 +61,6 @@ class PydanticFilter:
         :param dense: True if the filter should be dense, False otherwise
         :param reload_btn: True if the filter should have a reload button, False otherwise
         :param auto_reload: True if the filter should automatically reload, False otherwise
-        :param on_reload_external: A function that is called when the reload button is pressed
         :param stack_level: The stack level of the page
         :return: PydanticFilter
         """
@@ -91,12 +92,13 @@ class PydanticFilter:
         if type(self._name) is not str:
             raise TypeError(f"Invalid type '{type(self._name)}'")
 
-        self._get_models: Callable[[], list[BaseModel]] = self._parse_get_models(get_models)
+        self._get_models: Callable[[], list[BaseModel]] = get_models
+        self._model: Type[BaseModel] = model
         self._models: list[BaseModel] = []
         self._filtered_models: list[BaseModel] = []
         if current_filter is None:
             current_filter = []
-        self._current_filter: list[tuple[str, str, str, bool]] = self._parse_current_filter(current_filter)
+        self._current_filter: list[tuple[str, str, str, bool]] = current_filter
         if operator is None:
             operator = {}
 
@@ -114,17 +116,19 @@ class PydanticFilter:
         if ">=" not in operator.keys():
             operator[">="] = lambda field_value, value: field_value >= value
 
-        self._operator: dict[str, OperatorCallable] = self._parse_operator(operator)
-        self._is_reload_btn_enabled: bool = self._parse_reload_btn(reload_btn)
-        self._auto_reload: bool = self._parse_auto_reload(auto_reload)
+        self._operator: dict[str, OperatorCallable] = operator
+        self._is_reload_btn_enabled: bool = reload_btn
+        self._auto_reload: bool = auto_reload
 
         self._reload_timer: Optional[ui.timer] = None
         self._should_reload_timer: Optional[ui.timer] = None
-        self._should_reload: Optional[UiEventArguments] = None
-        self._on_reload_external: Optional[ExternalReloadCallable] = self._parse_on_reload_external(on_reload_external)
-        self._bind_object: Optional[object] = None
-        self._bind_function: Optional[ExternalReloadCallable] = None
-        self._on_reload_external_mode: Optional[Literal["pydantic", "dict", "str"]] = None
+        self._should_reload_last_time: Optional[float] = 0
+        self._should_reload: Union[UiEventArguments, str, None] = None
+
+        self._on_reload_state: Literal["ready", "before", "reload", "after"] = "ready"
+        self._on_reload_before: Optional[ExternalReloadCallable] = None
+        self._on_reload_after: Optional[ExternalReloadCallable] = None
+        self._on_reload_after_mode: Literal["pydantic", "dict", "str"] = mode
 
         self._reads: Optional[list[tuple[TextElement, ui.button, ui.button]]] = None
         self._edits: Optional[list[tuple[ui.select, ui.select, ui.input, ui.button, ui.button]]] = None
@@ -148,8 +152,7 @@ class PydanticFilter:
                  operator: Optional[dict[str, NewOperatorCallable]] = None,
                  dense: Optional[bool] = None,
                  reload_btn: Optional[bool] = None,
-                 auto_reload: Optional[bool] = None,
-                 on_reload_external: Optional[ExternalReloadCallable] = None):
+                 auto_reload: Optional[bool] = None):
         """
         Draws a filter for a list of models
 
@@ -160,7 +163,6 @@ class PydanticFilter:
         :param dense: True if the filter should be dense, False otherwise
         :param reload_btn: True if the filter should have a reload button, False otherwise
         :param auto_reload: True if the filter should automatically reload, False otherwise
-        :param on_reload_external: A function that is called when the reload button is pressed
         :return:
         """
 
@@ -172,39 +174,45 @@ class PydanticFilter:
             raise ValueError(f"Call {self.__class__.__name__}.__call__ only once")
         self._on_init_or_call = True
 
+        # get_models
         if get_models is None:
             get_models = self._get_models
-        self._get_models = self._parse_get_models(get_models)
+        if not callable(get_models):
+            raise TypeError(f"Invalid type '{type(get_models)}' for get_models, expected 'Callable[[], list[Dictable]]'")
+        self._get_models = get_models
 
         if current_filter is None:
             current_filter = self._current_filter
-        self.current_filter = self._parse_current_filter(current_filter)
+        self.current_filter = current_filter
+
+        if operator is None:
+            operator = self._operator
+        self.operator = operator
 
         if dense is None:
             dense = self.dense
-        self.dense = self._parse_dense(dense)
+        self.dense = dense
 
         if reload_btn is None:
             reload_btn = self.is_reload_btn_enabled
-        self.is_reload_btn_enabled = self._parse_reload_btn(reload_btn)
+        self.is_reload_btn_enabled = reload_btn
 
         if auto_reload is None:
             auto_reload = self._auto_reload
-        self.auto_reload = self._parse_auto_reload(auto_reload)
-
-        if on_reload_external is None:
-            on_reload_external = self._on_reload_external
-        self._on_reload_external = self._parse_on_reload_external(on_reload_external)
+        self.auto_reload = auto_reload
 
         self._reads = []
         self._edits = []
 
-        # should_reload_timer
-        if not refresh:
-            self._should_reload_timer = ui.timer(0.1, self._should_reload_timer_func)
-        else:
-            if self._should_reload_timer is None:
-                raise ValueError(f"{self}._should_reload_timer is None")
+        # # should_reload_timer
+        # if not refresh or not self._should_reload_running:
+        self._should_reload_timer = ui.timer(0.1, self._should_reload_timer_func)
+        # else:
+        #     if self._should_reload_timer is None:
+        #         raise ValueError(f"{self}._should_reload_timer is None")
+
+        if not self._called and self._auto_reload:  # load first time
+            self._should_reload = "init"
 
         with ui.row().classes("gap-x-0 gap-y-0"):
             if self.is_reload_btn_enabled:
@@ -269,7 +277,7 @@ class PydanticFilter:
         return self._client
 
     @property
-    def should_reload(self) -> Optional[UiEventArguments]:
+    def should_reload(self) -> Union[UiEventArguments, str, None]:
         """
         True if the filter should reload, False otherwise
 
@@ -278,38 +286,18 @@ class PydanticFilter:
 
         return self._should_reload
 
-    @classmethod
-    def _parse_get_models(cls, get_models: Callable[[], list[BaseModel]]) -> Callable[[], list[BaseModel]]:
+    @property
+    def _should_reload_running(self) -> bool:
         """
-        Parses the get_models parameter
+        True if the filter should reload, False otherwise
 
-        :param get_models: A function that returns a list of models
-        :return: Callable[[], list[BaseModel]]
-        """
-
-        if callable(get_models):
-            return get_models
-        raise TypeError(f"Invalid type '{type(get_models)}' for get_models, expected 'Callable[[], list[Dictable]]'")
-
-    @classmethod
-    def _parse_model(cls, models: Union[BaseModel, list[BaseModel]]) -> Union[BaseModel, list[BaseModel]]:
-        """
-        Parses the models parameter
-
-        :param models: A model or a list of models
-        :return: Union[BaseModel, list[BaseModel]]
+        :return: bool - True if the filter should reload, False otherwise
         """
 
-        if type(models) is list:
-            _models: list[BaseModel] = []
-            for model in models:
-                model_dict = cls._parse_model(model)
-                _models.append(model_dict)
-            return _models
-        else:
-            if not isinstance(models, BaseModel):
-                raise TypeError(f"Invalid type '{type(models)}'")
-            return models
+        delta = time.perf_counter() - self._should_reload_last_time
+        if delta < 0.1:
+            return True
+        return False
 
     @property
     def models(self) -> list[BaseModel]:
@@ -366,6 +354,9 @@ class PydanticFilter:
         """
 
         model_types = []
+
+        if self._model is not None:
+            model_types.append(self._model)
 
         for model in self._models:
             type_model = type(model)
@@ -436,30 +427,6 @@ class PydanticFilter:
         json_str = json.dumps(json_list, indent=4)
         return json_str
 
-    @classmethod
-    def _parse_current_filter(cls, current_filter: list[tuple[str, str, str, bool]]) -> list[tuple[str, str, str, bool]]:
-        """
-        Parses the current_filter parameter
-
-        :param current_filter: A list of tuples of the form (key, operator, value, value_type, is_new) where is_new is True if the filter is new and False otherwise
-        :return: list[tuple[str, str, str, bool]]
-        """
-
-        for c_filter in current_filter:
-            c_filter_key = c_filter[0]
-            if type(c_filter_key) is not str:
-                raise TypeError(f"Invalid type '{type(c_filter_key)}'")
-            c_filter_operator = c_filter[1]
-            if type(c_filter_operator) is not str:
-                raise TypeError(f"Invalid type '{type(c_filter_operator)}'")
-            c_filter_value = c_filter[2]
-            if type(c_filter_value) is not str:
-                raise TypeError(f"Invalid type '{type(c_filter_value)}'")
-            c_filter_new = c_filter[3]
-            if type(c_filter_new) is not bool:
-                raise TypeError(f"Invalid type '{type(c_filter_new)}'")
-        return deepcopy(current_filter)
-
     @property
     def current_filter(self) -> list[tuple[str, str, str, bool]]:
         """
@@ -475,11 +442,24 @@ class PydanticFilter:
     @current_filter.setter
     def current_filter(self, value: list[tuple[str, str, str, bool]]):
         logger.debug(f"Setting {self}.current_filter({value=})")
-        self._current_filter = deepcopy(self._parse_current_filter(value))
+        for c_filter in value:
+            c_filter_key = c_filter[0]
+            if type(c_filter_key) is not str:
+                raise TypeError(f"Invalid type '{type(c_filter_key)}'")
+            c_filter_operator = c_filter[1]
+            if type(c_filter_operator) is not str:
+                raise TypeError(f"Invalid type '{type(c_filter_operator)}'")
+            c_filter_value = c_filter[2]
+            if type(c_filter_value) is not str:
+                raise TypeError(f"Invalid type '{type(c_filter_value)}'")
+            c_filter_new = c_filter[3]
+            if type(c_filter_new) is not bool:
+                raise TypeError(f"Invalid type '{type(c_filter_new)}'")
+        self._current_filter = deepcopy(value)
         if not self._on_init_or_call and self._called:
             self.__call__.refresh()
 
-    def _parse_operator(self, operator: dict[str, Union[Callable[[Any], bool], Coroutine[Any, Any, bool]]]) -> dict[str, OperatorCallable]:
+    def _parse_operator(self, operator: dict[str, Any]) -> dict[str, OperatorCallable]:
         """
         Parses the operator parameter
 
@@ -540,27 +520,14 @@ class PydanticFilter:
 
         if self._operator is None:
             raise ValueError(f"Call {self.__class__.__name__}.__call__ first")
-        return deepcopy(self._operator)
+        return self._parse_operator(self._operator)
 
     @operator.setter
     def operator(self, value: dict[str, Union[Callable[[Any], bool], Coroutine[Any, Any, bool]]]):
         logger.debug(f"Setting {self}.operator({value=})")
-        self._operator = deepcopy(self._parse_operator(value))
+        self._operator = value
         if not self._on_init_or_call and self._called:
             self.__call__.refresh()
-
-    @classmethod
-    def _parse_dense(cls, dense: bool) -> bool:
-        """
-        Parses the dense parameter
-
-        :param dense: True if the filter should be dense, False otherwise
-        :return: bool
-        """
-
-        if type(dense) is not bool:
-            raise TypeError(f"Invalid type '{type(dense)}'")
-        return dense
 
     @property
     def dense(self) -> bool:
@@ -575,7 +542,8 @@ class PydanticFilter:
 
     @dense.setter
     def dense(self, value: bool):
-        value = self._parse_dense(value)
+        if type(value) is not bool:
+            raise TypeError(f"Invalid type '{type(value)}'")
         if value:
             self._dense = True
             self._bt_height = 40
@@ -587,19 +555,6 @@ class PydanticFilter:
         logger.debug(f"Setting {self}.dense({value=})")
         if not self._on_init_or_call and self._called:
             self.__call__.refresh()
-
-    @classmethod
-    def _parse_reload_btn(cls, reload_btn: bool) -> bool:
-        """
-        Parses the reload_btn parameter
-
-        :param reload_btn: True if the filter should have a reload button, False otherwise
-        :return: bool
-        """
-
-        if type(reload_btn) is not bool:
-            raise TypeError(f"Invalid type '{type(reload_btn)}'")
-        return reload_btn
 
     @property
     def is_reload_btn_enabled(self) -> bool:
@@ -614,22 +569,12 @@ class PydanticFilter:
 
     @is_reload_btn_enabled.setter
     def is_reload_btn_enabled(self, value: bool):
-        self._is_reload_btn_enabled = self._parse_reload_btn(value)
+        if type(value) is not bool:
+            raise TypeError(f"Invalid type '{type(value)}'")
+        self._is_reload_btn_enabled = value
         logger.debug(f"Setting {self}.is_reload_btn_enabled({value=})")
         if not self._on_init_or_call and self._called:
             self.__call__.refresh()
-
-    @classmethod
-    def _parse_auto_reload(cls, auto_reload: bool) -> bool:
-        """
-        Parses the auto_reload parameter
-        :param auto_reload: True if the filter should automatically reload, False otherwise
-        :return: bool
-        """
-
-        if type(auto_reload) is not bool:
-            raise TypeError(f"Invalid type '{type(auto_reload)}'")
-        return auto_reload
 
     @property
     def auto_reload(self) -> bool:
@@ -644,411 +589,96 @@ class PydanticFilter:
 
     @auto_reload.setter
     def auto_reload(self, value: bool):
-        self._auto_reload = self._parse_auto_reload(value)
+        if type(value) is not bool:
+            raise TypeError(f"Invalid type '{type(value)}'")
+        self._auto_reload = value
         logger.debug(f"Setting {self}.auto_reload({value=})")
         if not self._on_init_or_call and self._called:
             self.__call__.refresh()
 
-    @classmethod
-    def _parse_on_reload_external(cls, on_reload_external: Optional[ExternalReloadCallable]) -> Optional[ExternalReloadCallable]:
+    @property
+    def on_reload_before(self) -> Optional[ExternalReloadCallable]:
         """
-        Parses the on_reload_external parameter
-
-        :param on_reload_external: A function that is called when the reload button is pressed
-        :return: Optional[ExternalReloadCallable]
+        The on_reload_before of the filter
+        :return: ExternalReloadCallable - A copy of the on_reload_external_before
         """
 
-        if callable(on_reload_external):
-            return on_reload_external
-        elif isinstance(on_reload_external, Awaitable):
-            return on_reload_external
+        return self._on_reload_before
+
+    @on_reload_before.setter
+    def on_reload_before(self, value: ExternalReloadCallable):
+        logger.debug(f"Setting {self}.on_reload_before({value=})")
+        if not callable(value):
+            raise TypeError(f"Invalid type '{type(value)}'")
+        self._on_reload_before = value
+
+        if not self._on_init_or_call and self._called:
+            self.__call__.refresh()
+
+    @property
+    def on_reload_after(self) -> Optional[ExternalReloadCallable]:
+        """
+        The on_reload_after of the filter
+        :return: ExternalReloadCallable - A copy of the on_reload_external_after
+        """
+
+        return self._on_reload_after
+
+    @on_reload_after.setter
+    def on_reload_after(self, value: ExternalReloadCallable):
+        logger.debug(f"Setting {self}.on_reload_after({value=})")
+        if not callable(value):
+            raise TypeError(f"Invalid type '{type(value)}'")
+        if isinstance(value, ui.refreshable):
+            real_func = getattr(value, "refresh")
+            real_func_name = f"{value.__class__.__name__}.refresh"
         else:
-            logger.warning(f"Invalid type '{type(on_reload_external)}' for on_reload_external, expected 'Callable[[Any], bool]'")
-
-        return on_reload_external
-
-    @property
-    def on_reload_external_before_called(self) -> bool:
-        """
-        True if the on_reload_external_before function was called, False otherwise
-        :return: bool
-        """
-
-        global _BEFORE_CALLED
-
-        if _BEFORE_CALLED is None:
-            return False
-
-        _before_called = _BEFORE_CALLED.get(self.id, None)
-
-        if _before_called is None:
-            return False
-
-        return _before_called
-
-    @on_reload_external_before_called.setter
-    def on_reload_external_before_called(self, value: bool):
-        global _BEFORE_CALLED
-        if _BEFORE_CALLED is None:
-            _BEFORE_CALLED = {}
-        _BEFORE_CALLED[self.id] = value
-
-    @property
-    def on_reload_external_before_callable(self) -> Optional[ExternalReloadCallable]:
-        """
-        The on_reload_external_before function
-        :return: ExternalReloadCallable
-        """
-
-        global _BEFORE_CALLABLE
-
-        if _BEFORE_CALLABLE is None:
-            return None
-
-        _before_callable = _BEFORE_CALLABLE.get(self.id, None)
-
-        if _before_callable is None:
-            return None
-
-        return _before_callable
-
-    @on_reload_external_before_callable.setter
-    def on_reload_external_before_callable(self, value: ExternalReloadCallable):
-        global _BEFORE_CALLABLE
-        if _BEFORE_CALLABLE is None:
-            _BEFORE_CALLABLE = {}
-        _BEFORE_CALLABLE[self.id] = value
-
-    @property
-    def on_reload_external_called(self) -> bool:
-        """
-        True if the on_reload_external function was called, False otherwise
-        :return: bool
-        """
-
-        global _ON_RELOAD_EXTERNAL_CALLED
-
-        if _ON_RELOAD_EXTERNAL_CALLED is None:
-            return False
-
-        _on_reload_external_called = _ON_RELOAD_EXTERNAL_CALLED.get(self.id, None)
-
-        if _on_reload_external_called is None:
-            return False
-
-        return _on_reload_external_called
-
-    @on_reload_external_called.setter
-    def on_reload_external_called(self, value: bool):
-        global _ON_RELOAD_EXTERNAL_CALLED
-        if _ON_RELOAD_EXTERNAL_CALLED is None:
-            _ON_RELOAD_EXTERNAL_CALLED = {}
-        _ON_RELOAD_EXTERNAL_CALLED[self.id] = value
-
-    @property
-    def on_reload_external_callable(self) -> ExternalReloadCallable:
-        """
-        The on_reload_external function
-        :return: ExternalReloadCallable
-        """
-
-        global _ON_RELOAD_EXTERNAL_CALLABLE
-
-        if _ON_RELOAD_EXTERNAL_CALLABLE is None:
-            raise ValueError(f"Object {self} has no on_reload_external_callable")
-
-        _on_reload_external_callable = _ON_RELOAD_EXTERNAL_CALLABLE.get(self.id, None)
-
-        if _on_reload_external_callable is None:
-            raise ValueError(f"Object {self} has no on_reload_external_callable")
-
-        return _on_reload_external_callable
-
-    @on_reload_external_callable.setter
-    def on_reload_external_callable(self, value: ExternalReloadCallable):
-        global _ON_RELOAD_EXTERNAL_CALLABLE
-        if _ON_RELOAD_EXTERNAL_CALLABLE is None:
-            _ON_RELOAD_EXTERNAL_CALLABLE = {}
-        _ON_RELOAD_EXTERNAL_CALLABLE[self.id] = value
-
-    @property
-    def on_reload_external_after_called(self) -> bool:
-        """
-        True if the on_reload_external_after function was called, False otherwise
-        :return: bool
-        """
-
-        global _AFTER_CALLED
-
-        if _AFTER_CALLED is None:
-            return False
-
-        _after_called = _AFTER_CALLED.get(self.id, None)
-
-        if _after_called is None:
-            return False
-
-        return _after_called
-
-    @on_reload_external_after_called.setter
-    def on_reload_external_after_called(self, value: bool):
-        global _AFTER_CALLED
-        if _AFTER_CALLED is None:
-            _AFTER_CALLED = {}
-        _AFTER_CALLED[self.id] = value
-
-    @property
-    def on_reload_external_after_callable(self) -> Optional[ExternalReloadCallable]:
-        """
-        The on_reload_external_after function
-        :return: ExternalReloadCallable
-        """
-
-        global _AFTER_CALLABLE
-
-        if _AFTER_CALLABLE is None:
-            return None
-
-        _after_callable = _AFTER_CALLABLE.get(self.id, None)
-
-        if _after_callable is None:
-            return None
-
-        return _after_callable
-
-    @on_reload_external_after_callable.setter
-    def on_reload_external_after_callable(self, value: ExternalReloadCallable):
-        global _AFTER_CALLABLE
-        if _AFTER_CALLABLE is None:
-            _AFTER_CALLABLE = {}
-        _AFTER_CALLABLE[self.id] = value
-
-    async def _on_reload_external_before_context(self):
-        if asyncio.iscoroutinefunction(self.on_reload_external_before_callable):
-            async def _before():
-                logger.debug(f"Calling {self.on_reload_external_before_callable.__name__}() as coroutinefunction")
-                await self.on_reload_external_before_callable
-        else:
-            if asyncio.iscoroutine(self.on_reload_external_before_callable):
-                async def _before():
-                    logger.debug(f"Calling {self.on_reload_external_before_callable.__name__}() as coroutine")
-                    await self.on_reload_external_before_callable()
-            elif inspect.isfunction(self.on_reload_external_before_callable):
-                async def _before():
-                    logger.debug(f"Calling {self.on_reload_external_before_callable.__name__}() as function")
-                    self.on_reload_external_before_callable()
-            else:
-                _before = None
-
-        if self.on_reload_external_before_callable is not None:
-            await _before()
-
-        self.on_reload_external_before_called = True
-
-    async def _on_reload_external_context(self):
-        while not self.on_reload_external_before_called:
-            logger.debug(f"Waiting for {self._on_reload_external_before_context.__name__}() to finish")
-            await asyncio.sleep(0.001)
-
-        async def wrapper():
-            self._models = self.get_models()
-            self.on_reload_external_called = True
-
-        ui.timer(0.001, wrapper, once=True)
-
-    async def _on_reload_external_after_context(self):
-        if asyncio.iscoroutinefunction(self.on_reload_external_after_callable):
-            async def _after():
-                logger.debug(f"Calling {self.on_reload_external_after_callable.__name__}() as coroutinefunction")
-                await self.on_reload_external_after_callable
-        else:
-            if asyncio.iscoroutine(self.on_reload_external_after_callable):
-                async def _after():
-                    logger.debug(f"Calling {self.on_reload_external_after_callable.__name__}() as coroutine")
-                    await self.on_reload_external_after_callable()
-            elif inspect.isfunction(self.on_reload_external_after_callable):
-                async def _after():
-                    logger.debug(f"Calling {self.on_reload_external_after_callable.__name__}() as function")
-                    self.on_reload_external_after_callable()
-            else:
-                _after = None
-
-        while not self.on_reload_external_called:
-            logger.debug(f"Waiting for {self._on_reload_external_after_context.__name__}() to finish")
-            await asyncio.sleep(0.001)
-
-        if self.on_reload_external_after_callable is not None:
-            await _after()
-
-        self.on_reload_external_after_called = True
-
-    async def _on_reload_set(self,
-                             before: Optional[ExternalReloadCallable] = None,
-                             on_reload_external: Optional[ExternalReloadCallable] = None,
-                             after: Optional[ExternalReloadCallable] = None):
-        if before is not None:
-            self.on_reload_external_before_callable = before
-        if on_reload_external is not None:
-            self.on_reload_external_callable = on_reload_external
-        if after is not None:
-            self.on_reload_external_after_callable = after
-
-        self.on_reload_external_before_called = False
-        self.on_reload_external_called = False
-        self.on_reload_external_after_called = False
-
-        def start():
-            ui.timer(0.001, self._on_reload_external_before_context, once=True)
-            ui.timer(0.001, self._on_reload_external_context, once=True)
-            ui.timer(0.001, self._on_reload_external_after_context, once=True)
-
-        ui.timer(0.001, start, once=True)
-
-    async def _on_reload_reset(self):
-        self.on_reload_external_before_callable = None
-        self.on_reload_external_callable = None
-        self.on_reload_external_after_callable = None
-
-    def on_reload_external(self,
-                           bind_obj: ExternalReloadCallable,
-                           attr: str = None, bind_reverse: bool = True,
-                           on_reload_external_mode: Optional[Literal["pydantic", "dict", "json", "json_pretty"]] = None,
-                           before: Optional[ExternalReloadCallable] = None,
-                           after: Optional[ExternalReloadCallable] = None):
-        """
-        Binds a function to the on_reload event
-
-        :param bind_obj: Any object that has a function named 'attr' that takes a list of Union[BaseModel, dict, str] and returns None
-        :param attr: The name of the function
-        :param bind_reverse: True if the function should be bound to the on_reload event, False otherwise
-        :param on_reload_external_mode: The mode of the on_reload_external parameter. Can be "pydantic", "dict", "json" or "json_pretty".
-        If None, the mode is inferred from the annotation of the function
-        :param before: A function that is called before on_reload_external is called
-        :param after: A function that is called after on_reload_external is called
-        :return: None
-        """
-
-        async def _on_reload_external() -> None:
-            await self._on_reload_set(before=before, on_reload_external=self._on_reload_external, after=after)
-
-        def _on_reload_external_decorator(func: ExternalReloadCallable) -> ExternalReloadCallable:
-            if asyncio.iscoroutine(func):
-                async def bind(_attr: Union[ExternalReloadAttr, Ellipsis] = ...):
-                    if _attr is Ellipsis:
-                        _attr = attr_default
-                    if _attr is None:
-                        raise ValueError(f"Invalid value '{_attr}' for {attr=}, expected 'Union[list[BaseModel], list[dict], str]'")
-
-                    logger.debug(f"Calling {func.__name__}({attr=}) as coroutine")
-                    await func(_attr)
-
-                    self._reload_timer = ui.timer(5.001, _on_reload_external, once=True)
-            else:
-                def bind(_attr: Union[ExternalReloadAttr, Ellipsis] = ...):
-                    if _attr is Ellipsis:
-                        _attr = attr_default
-                    if _attr is None:
-                        raise ValueError(f"Invalid value '{_attr}' for {attr=}, expected 'Union[list[BaseModel], list[dict], str]'")
-
-                    logger.debug(f"Calling {func.__name__}({attr=}) as function")
-                    func(_attr)
-
-                    self._reload_timer = ui.timer(0.001, _on_reload_external, once=True)
-
-            return bind
-
-        def unbind() -> None:
-            logger.debug(f"Unbinding {bind_obj.__class__.__name__}.{attr} from {self}.on_reload()")
-            self._on_reload_reset()
-            setattr(bind_obj, attr, self._bind_function)
-
-        real_func_name = None
-        if attr is None:
-            if isinstance(bind_obj, ui.refreshable) and hasattr(bind_obj, "refresh"):
-                attr = "refresh"
-                real_func_name = "func"
-            else:
-                attr = "__call__"
-        if real_func_name is None:
-            real_func_name = attr
-        logger.debug(f"Setting {self}.on_reload_external({bind_obj=}, {attr=}, {bind_reverse=})")
-
-        self._bind_object = bind_obj
-        self._bind_function = getattr(bind_obj, attr)
-        real_func = getattr(bind_obj, real_func_name)
+            real_func = value
+            real_func_name = value.__name__
 
         real_func_sig_params = dict(inspect.signature(real_func).parameters)
         if len(real_func_sig_params) != 1:
-            raise ValueError(f"Invalid number of parameters '{len(real_func_sig_params)}' for {bind_obj.__class__.__name__}.{attr}, expected 1")
+            raise ValueError(f"Invalid number of parameters '{len(real_func_sig_params)}' for {real_func_name}, expected 1")
+        mode_set = False
         if real_func_sig_params[list(real_func_sig_params.keys())[0]].annotation is not inspect.Parameter.empty:
             attr_type = list(real_func_sig_params.values())[0].annotation
             attr_type_str = str(attr_type)
             if attr_type_str == "str":
-                self._on_reload_external_mode = "json"
+                self.on_reload_after_mode = "json"
+                mode_set = True
             elif attr_type_str == "list[dict]":
-                self._on_reload_external_mode = "dict"
+                self.on_reload_after_mode = "dict"
+                mode_set = True
             elif attr_type_str.startswith("list[") and attr_type_str.endswith("]"):
-                self._on_reload_external_mode = "pydantic"
+                self.on_reload_after_mode = "pydantic"
+                mode_set = True
             else:
-                raise ValueError(f"Invalid type '{attr_type}' for {bind_obj.__class__.__name__}.{attr}, expected 'list'")
-        else:
-            self._on_reload_external_mode = on_reload_external_mode
-        if self._on_reload_external_mode is None:
-            self._on_reload_external_mode = "pydantic"
+                logger.warning(f"Invalid type '{attr_type_str}' for {real_func_name}, expected 'str', 'list[dict]' or 'list[pydantic.BaseModel]'")
 
-        if self._on_reload_external_mode == "pydantic":
-            attr_default = []
-        elif self._on_reload_external_mode == "dict":
-            attr_default = []
-        elif self._on_reload_external_mode == "json":
-            attr_default = "[]"
-        elif self._on_reload_external_mode == "json_pretty":
-            attr_default = "[]"
-        else:
-            raise ValueError(f"Invalid value '{self._on_reload_external_mode}' for on_reload_external_mode, expected 'pydantic', 'dict', 'json' or 'json_pretty'")
-
-        self._on_reload_external = self._parse_on_reload_external(self._bind_function)
-
-        if bind_reverse:
-            logger.debug(f"Binding func {bind_obj.__class__.__name__}.{attr} to {self}.on_reload()")
-
-            # bind the function to the on_reload event
-            bound_func = _on_reload_external_decorator(self._bind_function)
-            setattr(bind_obj, attr, bound_func)
-
-            # set unbind handler
-            self.client.on_disconnect(unbind)
+        if not mode_set:
+            self.on_reload_after_mode = "pydantic"
+        self._on_reload_after = value
 
         if not self._on_init_or_call and self._called:
             self.__call__.refresh()
-            self._reload_timer = ui.timer(0.001, _on_reload_external, once=True)
 
-    @classmethod
-    def _parse_on_reload_external_mode(cls, on_reload_external_mode: Literal["pydantic", "dict", "str"]) -> Literal["pydantic", "dict", "json", "json_pretty"]:
+    @property
+    def on_reload_after_mode(self) -> Literal["pydantic", "dict", "str"]:
         """
-        Parses the on_reload_external_mode parameter
-
-        :param on_reload_external_mode: The mode of the on_reload_external parameter. Can be "pydantic", "dict" or "str"
+        The mode of the on_reload_external_after parameter. Can be "pydantic", "dict" or "str"
         :return: Literal["pydantic", "dict", "str"]
         """
 
-        if type(on_reload_external_mode) is not str:
-            raise TypeError(f"Invalid type '{type(on_reload_external_mode)}'")
-        if on_reload_external_mode not in ["pydantic", "dict", "json", "json_pretty"]:
-            raise ValueError(f"Invalid value '{on_reload_external_mode}' for on_reload_external_mode, expected 'pydantic', 'dict' or 'str'")
-        return on_reload_external_mode
+        return self._on_reload_after_mode
 
-    @property
-    def on_reload_external_mode(self) -> Literal["pydantic", "dict", "json", "json_pretty"]:
-        """
-        The mode of the on_reload_external parameter. Can be "pydantic", "dict" , "json" or "json_pretty"
-        :return: Literal["pydantic", "dict", "json", "json_pretty"]
-        """
-
-        if self._on_reload_external_mode is None:
-            raise ValueError(f"Call {self.__class__.__name__}.on_reload_external() first")
-
-        return self._on_reload_external_mode
+    @on_reload_after_mode.setter
+    def on_reload_after_mode(self, value: Literal["pydantic", "dict", "str"]):
+        logger.debug(f"Setting {self}.on_reload_external_after_mode({value=})")
+        if type(value) is not str:
+            raise TypeError(f"Invalid type '{type(value)}'")
+        if value not in ["pydantic", "dict", "str"]:
+            raise ValueError(f"Invalid value '{value}'")
+        self._on_reload_after_mode = value
 
     @property
     def reads(self) -> list[tuple[TextElement, ui.button, ui.button]]:
@@ -1328,7 +958,7 @@ class PydanticFilter:
             return
         self.delete_filter(i=i)
         if self._auto_reload:
-            await self._on_reload(event)
+            self._should_reload = event
 
     async def on_remove_button(self, event: UiEventArguments, index: int) -> bool:
         """
@@ -1352,7 +982,7 @@ class PydanticFilter:
         if not await self.on_confirm_button(event, index=i):
             return
         backup = self._current_filter[i]
-        self.set_filter(index=i, key=self._edits[i][0].value, operator=self._edits[i][1].value, value=self._edits[i][2].value)
+        self.set_filter(index=i, key=self._edits[i][0]._value, operator=self._edits[i][1]._value, value=self._edits[i][2]._value)
         value = self._current_filter[i][2]
         result = await self.validate_filter(index=i, value=value)
         if type(result) is ValueError:
@@ -1363,7 +993,7 @@ class PydanticFilter:
             self._set_read(i=i)
 
             if self._auto_reload:
-                await self._on_reload(event)
+                self._should_reload = event
 
     async def on_confirm_button(self, event: UiEventArguments, index: int) -> bool:
         """
@@ -1416,6 +1046,9 @@ class PydanticFilter:
 
         if not await self.on_reload_button(event):
             return
+
+        if self._on_reload_state != "ready":
+            return
         self._should_reload = event
 
     async def on_reload_button(self, event: UiEventArguments) -> bool:
@@ -1429,9 +1062,9 @@ class PydanticFilter:
         return True
 
     async def _should_reload_timer_func(self) -> None:
+        self._should_reload_last_tick = time.perf_counter()
         if self._should_reload is not None:
             await self._on_reload(self._should_reload)
-            self._should_reload = None
 
     async def _on_reload(self, event: Union[UiEventArguments, str]):
         """
@@ -1440,44 +1073,50 @@ class PydanticFilter:
         :return: None
         """
 
-        if not await self.on_reload(event):
-            return
+        if self._should_reload is None:
+            raise RuntimeError(f"Invalid call!")
 
-        logger.debug(f"{self}.{self._on_reload.__name__}({event}) reloading")
+        if self._on_reload_state == "ready":
+            if not await self.on_reload(event):
+                self._should_reload = None
+            # refresh
+            self.__call__.refresh()
+            self._on_reload_state = "before"
+        elif self._on_reload_state == "before":
+            if self.on_reload_before is not None:
+                if asyncio.iscoroutinefunction(self.on_reload_before):
+                    logger.debug(f"{self}.{self._on_reload.__name__}({event}) calling {self.on_reload_before.__name__} as coroutine function")
+                    await self.on_reload_before()
+                else:
+                    logger.debug(f"{self}.{self._on_reload.__name__}({event}) calling {self.on_reload_before.__name__} as function")
+                    self.on_reload_before()
+            self._on_reload_state = "reload"
+        elif self._on_reload_state == "reload":
+            self._models = self.get_models()
 
-        # set reload timer
-        await self._on_reload_set()
-
-        # refresh
-        self.__call__.refresh()
-
-        if self._on_reload_external is None:
-            return
-
-        # match
-        await self._match()
-
-        # call
-        if asyncio.iscoroutinefunction(self.on_reload_external):
-            logger.debug(f"{self}.{self._on_reload.__name__}({event}) calling {self.on_reload_external.__name__} as coroutine function")
-            await self._on_reload_external
-        else:
-            if self.on_reload_external_mode == "pydantic":
-                attr = self.filtered_models
-            elif self.on_reload_external_mode == "dict":
-                attr = self.filtered_models_dict
-            elif self.on_reload_external_mode == "json":
-                attr = self.filtered_models_json
-            elif self.on_reload_external_mode == "json_pretty":
-                attr = self.filtered_models_json_pretty
-            else:
-                raise ValueError(f"Invalid value '{self.on_reload_external_mode}' for on_reload_external_mode, expected 'pydantic', 'dict', 'json' or 'json_pretty'")
-            if asyncio.iscoroutine(self._on_reload_external):
-                logger.debug(f"{self}.{self._on_reload.__name__}({event}) calling {self._on_reload_external.__name__} as coroutine")
-                await self._on_reload_external(attr)
-            else:
-                logger.debug(f"{self}.{self._on_reload.__name__}({event}) calling {self._on_reload_external.__name__} as function")
-                self._on_reload_external(attr)
+            # match
+            await self._match()
+            self._on_reload_state = "after"
+        elif self._on_reload_state == "after":
+            if self.on_reload_after is not None:
+                if self.on_reload_after_mode == "pydantic":
+                    attr = self.filtered_models
+                elif self.on_reload_after_mode == "dict":
+                    attr = self.filtered_models_dict
+                elif self.on_reload_after_mode == "json":
+                    attr = self.filtered_models_json
+                elif self.on_reload_after_mode == "json_pretty":
+                    attr = self.filtered_models_json_pretty
+                else:
+                    raise ValueError(f"Invalid value '{self.on_reload_after_mode}' for on_reload_external_mode, expected 'pydantic', 'dict', 'json' or 'json_pretty'")
+                if asyncio.iscoroutinefunction(self.on_reload_after):
+                    logger.debug(f"{self}.{self._on_reload.__name__}({event}) calling {self.on_reload_after.__name__} as coroutine function")
+                    await self.on_reload_after(attr)
+                else:
+                    logger.debug(f"{self}.{self._on_reload.__name__}({event}) calling {self.on_reload_after.__name__} as function")
+                    self.on_reload_after(attr)
+            self._on_reload_state = "ready"
+            self._should_reload = None
 
     async def on_reload(self, event: Union[UiEventArguments, str]) -> bool:
         """
@@ -1502,7 +1141,7 @@ class PydanticFilter:
             return
 
     async def on_key_changed(self, event: ValueChangeEventArguments, index: int) -> str:
-        key = event.value
+        key = event._value
         logger.debug(f"{self}.{self.on_key_changed.__name__}({event}, {index=}) -> {key=}")
 
         return key
@@ -1519,7 +1158,7 @@ class PydanticFilter:
             return
 
     async def on_operator_changed(self, event: ValueChangeEventArguments, index: int) -> str:
-        operator = event.value
+        operator = event._value
         logger.debug(f"{self}.{self.on_operator_changed.__name__}({event}, {index=}) -> {operator=}")
 
         return operator
@@ -1534,7 +1173,7 @@ class PydanticFilter:
             return
 
     async def on_value_changed(self, event: ValueChangeEventArguments, index: int) -> str:
-        value = event.value
+        value = event._value
         logger.debug(f"{self}.{self.on_value_changed.__name__}({event}, {index=}) -> {value=}")
 
         return value
@@ -1629,6 +1268,7 @@ class PydanticFilter:
         :param value: The value of the filter
         :return: bool - True if the filter should be validated, False otherwise
         """
+
         logger.debug(f"{self}.{self.on_validate.__name__}({index=}, {field=}, {field_value=}, {value=}) called")
         return True
 
@@ -1652,8 +1292,20 @@ class PydanticFilter:
         :return: list[BaseModel] - The models of the filter
         """
 
+        models = self._get_models()
+
         logger.debug(f"Getting {self}.{self.get_models.__name__}()")
-        return self._parse_model(self._get_models())
+        if type(models) is list:
+            _models: list[BaseModel] = []
+            for model in models:
+                if not isinstance(model, BaseModel):
+                    raise TypeError(f"Invalid type '{type(model)}'")
+                _models.append(model)
+            return _models
+        else:
+            if not isinstance(models, BaseModel):
+                raise TypeError(f"Invalid type '{type(models)}'")
+            return [models]
 
     def set_visibility(self, index: int, visible: bool) -> None:
         """
@@ -1663,6 +1315,7 @@ class PydanticFilter:
         :return: None
         :return:
         """
+
         logger.debug(f"Setting {self}.{self.set_visibility.__name__}({index=}, {visible=})")
         for r in self._reads[index]:
             r.set_visibility(not visible)
@@ -1731,3 +1384,21 @@ class PydanticFilter:
         self.reads.pop(i)
         self.edits.pop(i)
         self._current_filter.pop(i)
+
+    def reload(self, force: bool = False) -> None:
+        """
+        Reloads the filter
+
+        :param force: True if the filter should be reloaded even if it is not ready, False otherwise
+        :return: None
+        """
+
+        logger.debug(f"Reloading {self}.{self.reload.__name__}()")
+
+        if force:
+            self._should_reload = "reload"
+        else:
+            if self._on_reload_state == "ready":
+                self._should_reload = "reload"
+            else:
+                logger.warning(f"Invalid state '{self._on_reload_state}'. Try again later or call {self}.{self._on_reload.__name__}(force=True)")
